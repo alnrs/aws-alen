@@ -1,88 +1,203 @@
-AWSTemplateFormatVersion: 2010-09-09
-Description: Test Stack
+AWSTemplateFormatVersion: '2010-09-09'
+Description: MedEquip Multi-VPC Cloud Infrastructure with Web App, DB, Peering, Load Balancer, and DNS
+
+Parameters:
+  KeyName:
+    Description: EC2 KeyPair for SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2 instance type
+  DBUsername:
+    NoEcho: true
+    Type: String
+  DBPassword:
+    NoEcho: true
+    Type: String
 
 Resources:
+
+  # VPC 1: Inventory & Logistics
   VPC1:
     Type: AWS::EC2::VPC
     Properties:
-      CidrBlock: 10.0.0.0/16
-      EnableDnsSupport: true
-      EnableDnsHostnames: true
+      CidrBlock: 10.10.0.0/16
       Tags:
         - Key: Name
-          Value: VPC1
-  # Subnet for Web Server (Public subnet in VPC1)
-  PublicSubnetVPC1:
+          Value: VPC1-Inventory
+
+  VPC1Subnet:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC1
-      CidrBlock: 10.0.1.0/24
-      MapPublicIpOnLaunch: true
-      AvailabilityZone: !Select
-        - 0
-        - !GetAZs ''
+      CidrBlock: 10.10.1.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
       Tags:
         - Key: Name
-          Value: Public-Subnet-VPC1
-  # Internet Gateway for VPC1 (for web server)
-  InternetGateway:
+          Value: VPC1-Subnet
+
+  # VPC 2: R&D & Customer Service
+  VPC2:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      Tags:
+        - Key: Name
+          Value: VPC2-RnD
+
+  VPC2Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC2
+      CidrBlock: 10.20.1.0/24
+      AvailabilityZone: !Select [ 1, !GetAZs "" ]
+      Tags:
+        - Key: Name
+          Value: VPC2-Subnet
+
+  # VPC Peering
+  VPCPeering:
+    Type: AWS::EC2::VPCPeeringConnection
+    Properties:
+      VpcId: !Ref VPC1
+      PeerVpcId: !Ref VPC2
+
+  # Internet Gateway and Routing for VPC1
+  IGW1:
     Type: AWS::EC2::InternetGateway
-  AttachGateway:
+
+  AttachGateway1:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
       VpcId: !Ref VPC1
-      InternetGatewayId: !Ref InternetGateway
-  # Route Table for Public Subnet in VPC1
-  PublicRouteTableVPC1:
+      InternetGatewayId: !Ref IGW1
+
+  RouteTable1:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC1
-  PublicRoute:
+
+  Route1:
     Type: AWS::EC2::Route
-    DependsOn: AttachGateway
+    DependsOn: AttachGateway1
     Properties:
-      RouteTableId: !Ref PublicRouteTableVPC1
+      RouteTableId: !Ref RouteTable1
       DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref InternetGateway
-  # Associate Public Route Table with Public Subnet
-  PublicRouteTableAssociation:
+      GatewayId: !Ref IGW1
+
+  SubnetRouteTableAssoc1:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref PublicSubnetVPC1
-      RouteTableId: !Ref PublicRouteTableVPC1
-  # Security Group for Web Server in VPC1
-  WebServerSecurityGroup:
+      SubnetId: !Ref VPC1Subnet
+      RouteTableId: !Ref RouteTable1
+
+  # Security Group
+  InstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow HTTP and SSH
+      GroupDescription: Allow HTTP, HTTPS, and SSH
       VpcId: !Ref VPC1
       SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
         - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
+          FromPort: 443
+          ToPort: 443
           CidrIp: 0.0.0.0/0
-  # EC2 Instance for Web Server in VPC1
-  WebServerInstance:
+
+  # EC2 for Web App
+  WebInstance:
     Type: AWS::EC2::Instance
     Properties:
-      InstanceType: t3.small
-      ImageId: ami-0a5c3558529277641
-      SubnetId: !Ref PublicSubnetVPC1
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref VPC1Subnet
+      ImageId: ami-0c02fb55956c7d316 # Amazon Linux 2
       SecurityGroupIds:
-        - !Ref WebServerSecurityGroup
-      KeyName: vockey
-      UserData: !Base64 |
-        #!/bin/bash
-        yum update -y
-        yum install -y httpd php php-mysql
-        systemctl start httpd
-        systemctl enable httpd
-        echo "<?php phpinfo(); ?>" > /var/www/html/index.php
+        - !Ref InstanceSecurityGroup
+      Tags:
+        - Key: Name
+          Value: WebServer
+
+  # Load Balancer
+  WebAppELB:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      Subnets:
+        - !Ref VPC1Subnet
+      Listeners:
+        - LoadBalancerPort: 80
+          InstancePort: 80
+          Protocol: HTTP
+      HealthCheck:
+        Target: HTTP:80/
+        HealthyThreshold: 3
+        UnhealthyThreshold: 5
+        Interval: 30
+        Timeout: 5
+      Instances:
+        - !Ref WebInstance
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+
+  # RDS DB (MySQL)
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      Engine: mysql
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBInstanceIdentifier: medequip-db
+      VPCSecurityGroups:
+        - !Ref InstanceSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for DB
+      SubnetIds:
+        - !Ref VPC1Subnet
+        - !Ref VPC2Subnet
+
+  # DNS with Route53 (mocked domain setup)
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: medequip.internal
+
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: medequip.internal.
+      Name: app.medequip.internal.
+      Type: A
+      TTL: '60'
+      ResourceRecords:
+        - !GetAtt WebAppELB.DNSName
+
 Outputs:
-  WebServerPublicIP:
-    Description: Public IP address of the web server instance
-    Value: !GetAtt WebServerInstance.PublicIp
+  VPC1ID:
+    Value: !Ref VPC1
+  VPC2ID:
+    Value: !Ref VPC2
+  PeeringConnection:
+    Value: !Ref VPCPeering
+  WebURL:
+    Value: !GetAtt WebAppELB.DNSName
+    Description: Public URL of the Load Balanced Web Application
